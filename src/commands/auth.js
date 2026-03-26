@@ -246,6 +246,7 @@ async function configureJmap(opts) {
 }
 
 async function configureCozy(opts) {
+  // Direct token mode (CI/scripting fallback)
   if (opts.url && opts.token) {
     setServiceConfig('cozy', {
       instanceUrl: opts.url,
@@ -258,24 +259,136 @@ async function configureCozy(opts) {
   const { default: Enquirer } = await import('enquirer');
   const prompt = Enquirer.prompt.bind(Enquirer);
 
-  console.log('\n--- Twake Drive (Cozy) ---\n');
+  console.log('\n--- Twake Drive (Cozy OAuth) ---\n');
 
-  const answers = await prompt([
+  const { instanceUrl } = await prompt([
     {
       type: 'input',
       name: 'instanceUrl',
       message: 'Cozy instance URL',
-      initial: 'https://you.twake.app',
-    },
-    {
-      type: 'password',
-      name: 'token',
-      message: 'OAuth token',
+      initial: 'https://jacob.twake.app',
     },
   ]);
 
-  setServiceConfig('cozy', answers);
-  console.log('Twake Drive: connected');
+  const port = 8933;
+  const redirectUri = `http://localhost:${port}/callback`;
+
+  // Step 1: Register OAuth client with the Cozy instance
+  console.log('Registering twake-cli with your Cozy instance...');
+
+  const regRes = await fetch(`${instanceUrl}/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: JSON.stringify({
+      client_name: 'twake-cli',
+      client_kind: 'CLI',
+      client_uri: 'https://github.com/JacobiusMakes/twake-cli',
+      redirect_uris: [redirectUri],
+      software_id: 'io.github.jacobiumakes.twake-cli',
+    }),
+  });
+
+  if (!regRes.ok) {
+    const err = await regRes.text().catch(() => '');
+    throw new Error(`OAuth registration failed: ${regRes.status} ${err}`);
+  }
+
+  const client = await regRes.json();
+  const clientId = client.client_id;
+  const clientSecret = client.client_secret;
+
+  // Step 2: Open browser for authorization
+  const scope = 'io.cozy.files io.cozy.files.metadata';
+  const state = Math.random().toString(36).slice(2);
+
+  const authCode = await new Promise((resolve, reject) => {
+    const server = createServer((req, res) => {
+      const url = new URL(req.url, `http://localhost:${port}`);
+
+      if (url.pathname === '/callback') {
+        const code = url.searchParams.get('code');
+        const returnedState = url.searchParams.get('state');
+
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>twake-cli</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{min-height:100vh;display:flex;align-items:center;justify-content:center;
+font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background:#0d1117;color:#e6edf3}
+.card{text-align:center;padding:3rem;border-radius:16px;
+background:linear-gradient(145deg,#161b22,#1c2333);
+border:1px solid #30363d;box-shadow:0 8px 32px rgba(0,0,0,.4);max-width:420px}
+.check{width:64px;height:64px;margin:0 auto 1.5rem;border-radius:50%;
+background:#238636;display:flex;align-items:center;justify-content:center;
+animation:pop .4s cubic-bezier(.34,1.56,.64,1)}
+.check svg{width:32px;height:32px}
+h1{font-size:1.5rem;font-weight:600;margin-bottom:.5rem}
+p{color:#8b949e;line-height:1.6}
+.closing{margin-top:1.5rem;font-size:.85rem;color:#58a6ff}
+@keyframes pop{0%{transform:scale(0)}100%{transform:scale(1)}}
+</style></head><body>
+<div class="card">
+<div class="check"><svg fill="none" stroke="#fff" stroke-width="3" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg></div>
+<h1>Twake Drive connected</h1>
+<p>twake-cli can now access your files. Return to your terminal.</p>
+<p class="closing">You can close this tab now.</p>
+</div></body></html>`);
+        server.close();
+
+        if (code && returnedState === state) {
+          resolve(code);
+        } else {
+          reject(new Error('OAuth callback missing code or state mismatch'));
+        }
+      }
+    });
+
+    server.listen(port, () => {
+      const authUrl = `${instanceUrl}/auth/authorize?client_id=${clientId}&response_type=code&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&state=${state}`;
+
+      console.log('Opening browser for Twake Drive authorization...');
+      console.log(`If it doesn't open, go to:\n  ${authUrl}\n`);
+
+      import('child_process').then(({ exec }) => {
+        exec(`open "${authUrl}"`);
+      });
+    });
+
+    setTimeout(() => {
+      server.close();
+      reject(new Error('OAuth authorization timed out after 2 minutes'));
+    }, 120000);
+  });
+
+  // Step 3: Exchange auth code for access token
+  const tokenRes = await fetch(`${instanceUrl}/auth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code: authCode,
+      client_id: clientId,
+      client_secret: clientSecret,
+    }),
+  });
+
+  if (!tokenRes.ok) {
+    const err = await tokenRes.text().catch(() => '');
+    throw new Error(`Token exchange failed: ${tokenRes.status} ${err}`);
+  }
+
+  const tokenData = await tokenRes.json();
+
+  setServiceConfig('cozy', {
+    instanceUrl,
+    token: tokenData.access_token,
+    refreshToken: tokenData.refresh_token,
+    clientId,
+    clientSecret,
+  });
+
+  console.log('Twake Drive: connected via OAuth');
 }
 
 async function configureLinshare(opts) {
