@@ -12,6 +12,7 @@
 
 import { Command } from 'commander';
 import { isServiceConfigured, getServiceConfig } from '../config.js';
+import { redactTokens, USER_AGENT } from '../security.js';
 
 export function searchCommand() {
   const search = new Command('search')
@@ -73,6 +74,7 @@ async function searchChat(query, limit) {
       headers: {
         'Authorization': `Bearer ${cfg.accessToken}`,
         'Content-Type': 'application/json',
+        'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
       },
       body: JSON.stringify({
         search_categories: {
@@ -103,7 +105,8 @@ async function searchChat(query, limit) {
 
     return { count: sliced.length };
   } catch (err) {
-    console.log(`--- Twake Chat: search failed (${err.message}) ---\n`);
+    // SECURITY: redact tokens from error messages
+    console.log(`--- Twake Chat: search failed (${redactTokens(err.message)}) ---\n`);
     return { count: 0 };
   }
 }
@@ -113,7 +116,10 @@ async function searchMail(query, limit) {
 
   try {
     const session = await fetch(cfg.sessionUrl, {
-      headers: { 'Authorization': `Bearer ${cfg.bearerToken}` },
+      headers: {
+        'Authorization': `Bearer ${cfg.bearerToken}`,
+        'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
+      },
     }).then(r => r.json());
 
     const accountId = cfg.accountId || Object.keys(session.accounts)[0];
@@ -123,6 +129,7 @@ async function searchMail(query, limit) {
       headers: {
         'Authorization': `Bearer ${cfg.bearerToken}`,
         'Content-Type': 'application/json',
+        'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
       },
       body: JSON.stringify({
         using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
@@ -147,7 +154,8 @@ async function searchMail(query, limit) {
 
     return { count: emails.length };
   } catch (err) {
-    console.log(`--- Twake Mail: search failed (${err.message}) ---\n`);
+    // SECURITY: redact tokens from error messages
+    console.log(`--- Twake Mail: search failed (${redactTokens(err.message)}) ---\n`);
     return { count: 0 };
   }
 }
@@ -167,6 +175,7 @@ async function searchDrive(query, limit) {
         headers: {
           'Authorization': `Bearer ${cfg.token}`,
           'Accept': 'application/vnd.api+json',
+          'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
         },
       });
 
@@ -199,7 +208,8 @@ async function searchDrive(query, limit) {
 
     return { count: matches.length };
   } catch (err) {
-    console.log(`--- Twake Drive: search failed (${err.message}) ---\n`);
+    // SECURITY: redact tokens from error messages
+    console.log(`--- Twake Drive: search failed (${redactTokens(err.message)}) ---\n`);
     return { count: 0 };
   }
 }
@@ -212,6 +222,7 @@ async function searchLinshare(query, limit) {
       headers: {
         'Authorization': `Bearer ${cfg.jwt}`,
         'Accept': 'application/json',
+        'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
       },
     }).then(r => r.json());
 
@@ -231,7 +242,8 @@ async function searchLinshare(query, limit) {
 
     return { count: matches.length };
   } catch (err) {
-    console.log(`--- LinShare: search failed (${err.message}) ---\n`);
+    // SECURITY: redact tokens from error messages
+    console.log(`--- LinShare: search failed (${redactTokens(err.message)}) ---\n`);
     return { count: 0 };
   }
 }

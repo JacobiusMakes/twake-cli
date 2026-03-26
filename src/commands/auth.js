@@ -14,6 +14,7 @@
 import { Command } from 'commander';
 import { createServer } from 'http';
 import { setServiceConfig, clearServiceConfig, isServiceConfigured, getServiceConfig, getConfigPath } from '../config.js';
+import { validateHttpsUrl, timingSafeCompare, redactTokens, safeError, USER_AGENT } from '../security.js';
 
 export function authCommand() {
   const auth = new Command('auth')
@@ -95,6 +96,8 @@ export function authCommand() {
 async function configureMatrix(opts) {
   // Direct token mode (CI/scripting fallback)
   if (opts.homeserver && opts.token) {
+    // SECURITY: Validate homeserver URL is HTTPS before storing
+    validateHttpsUrl(opts.homeserver, 'Matrix homeserver URL');
     setServiceConfig('matrix', {
       homeserver: opts.homeserver,
       accessToken: opts.token,
@@ -118,15 +121,34 @@ async function configureMatrix(opts) {
     },
   ]);
 
+  // SECURITY: Validate homeserver URL is HTTPS before proceeding
+  validateHttpsUrl(homeserver, 'Matrix homeserver URL');
+
   // Start local server to receive SSO callback
   const port = 8932;
   const redirectUrl = `http://localhost:${port}/callback`;
 
   const loginToken = await new Promise((resolve, reject) => {
+    /**
+     * SECURITY: Rate-limit the callback server — accept exactly one
+     * request on /callback, then immediately close the listener.
+     * This prevents an attacker from repeatedly probing the local
+     * server to steal or replay the login token.
+     */
+    let callbackHandled = false;
+
     const server = createServer((req, res) => {
       const url = new URL(req.url, `http://localhost:${port}`);
 
+      // SECURITY: Reject all requests after the first callback
+      if (callbackHandled) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('Forbidden — callback already processed.');
+        return;
+      }
+
       if (url.pathname === '/callback') {
+        callbackHandled = true; // SECURITY: mark as handled before any async work
         const token = url.searchParams.get('loginToken');
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>twake-cli</title>
@@ -154,7 +176,7 @@ p{color:#8b949e;line-height:1.6}
 <p class="closing">You can close this tab now.</p>
 </div>
 </body></html>`);
-        server.close();
+        server.close(); // SECURITY: close immediately after single callback
 
         if (token) {
           resolve(token);
@@ -186,7 +208,10 @@ p{color:#8b949e;line-height:1.6}
   // Exchange login token for access token
   const res = await fetch(`${homeserver}/_matrix/client/v3/login`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
+    },
     body: JSON.stringify({
       type: 'm.login.token',
       token: loginToken,
@@ -196,7 +221,8 @@ p{color:#8b949e;line-height:1.6}
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(`Token exchange failed: ${err.error || res.statusText}`);
+    // SECURITY: redact any tokens that might appear in error response
+    throw new Error(`Token exchange failed: ${redactTokens(err.error || res.statusText)}`);
   }
 
   const data = await res.json();
@@ -213,6 +239,8 @@ p{color:#8b949e;line-height:1.6}
 
 async function configureJmap(opts) {
   if (opts.url && opts.token) {
+    // SECURITY: Validate JMAP session URL is HTTPS before storing
+    validateHttpsUrl(opts.url, 'JMAP session URL');
     setServiceConfig('jmap', {
       sessionUrl: opts.url,
       bearerToken: opts.token,
@@ -241,6 +269,9 @@ async function configureJmap(opts) {
     },
   ]);
 
+  // SECURITY: Validate JMAP session URL is HTTPS before storing
+  validateHttpsUrl(answers.sessionUrl, 'JMAP session URL');
+
   setServiceConfig('jmap', answers);
   console.log('Twake Mail: connected');
 }
@@ -248,6 +279,8 @@ async function configureJmap(opts) {
 async function configureCozy(opts) {
   // Direct token mode (CI/scripting fallback)
   if (opts.url && opts.token) {
+    // SECURITY: Validate Cozy instance URL is HTTPS before storing
+    validateHttpsUrl(opts.url, 'Cozy instance URL');
     setServiceConfig('cozy', {
       instanceUrl: opts.url,
       token: opts.token,
@@ -270,6 +303,9 @@ async function configureCozy(opts) {
     },
   ]);
 
+  // SECURITY: Validate Cozy instance URL is HTTPS before proceeding
+  validateHttpsUrl(instanceUrl, 'Cozy instance URL');
+
   const port = 8933;
   const redirectUri = `http://localhost:${port}/callback`;
 
@@ -278,7 +314,7 @@ async function configureCozy(opts) {
 
   const regRes = await fetch(`${instanceUrl}/auth/register`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json', 'User-Agent': USER_AGENT },
     body: JSON.stringify({
       client_name: 'twake-cli',
       client_kind: 'CLI',
@@ -290,7 +326,8 @@ async function configureCozy(opts) {
 
   if (!regRes.ok) {
     const err = await regRes.text().catch(() => '');
-    throw new Error(`OAuth registration failed: ${regRes.status} ${err}`);
+    // SECURITY: redact any tokens in error response before throwing
+    throw new Error(`OAuth registration failed: ${regRes.status} ${redactTokens(err)}`);
   }
 
   const client = await regRes.json();
@@ -302,10 +339,24 @@ async function configureCozy(opts) {
   const state = Math.random().toString(36).slice(2);
 
   const authCode = await new Promise((resolve, reject) => {
+    /**
+     * SECURITY: Rate-limit the OAuth callback server — accept exactly
+     * one request on /callback, then close. Prevents repeated probing.
+     */
+    let callbackHandled = false;
+
     const server = createServer((req, res) => {
       const url = new URL(req.url, `http://localhost:${port}`);
 
+      // SECURITY: Reject all requests after the first callback
+      if (callbackHandled) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('Forbidden — callback already processed.');
+        return;
+      }
+
       if (url.pathname === '/callback') {
+        callbackHandled = true; // SECURITY: mark as handled before any async work
         const code = url.searchParams.get('code');
         const returnedState = url.searchParams.get('state');
 
@@ -334,9 +385,14 @@ p{color:#8b949e;line-height:1.6}
 <p>twake-cli can now access your files. Return to your terminal.</p>
 <p class="closing">You can close this tab now.</p>
 </div></body></html>`);
-        server.close();
+        server.close(); // SECURITY: close immediately after single callback
 
-        if (code && returnedState === state) {
+        /**
+         * SECURITY: Use timing-safe comparison for the OAuth state parameter.
+         * A naive === leaks information about matching prefix bytes, allowing
+         * an attacker to guess the state token one byte at a time.
+         */
+        if (code && timingSafeCompare(returnedState, state)) {
           resolve(code);
         } else {
           reject(new Error('OAuth callback missing code or state mismatch'));
@@ -364,7 +420,7 @@ p{color:#8b949e;line-height:1.6}
   // Step 3: Exchange auth code for access token
   const tokenRes = await fetch(`${instanceUrl}/auth/access_token`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': USER_AGENT },
     body: new URLSearchParams({
       grant_type: 'authorization_code',
       code: authCode,
@@ -375,7 +431,8 @@ p{color:#8b949e;line-height:1.6}
 
   if (!tokenRes.ok) {
     const err = await tokenRes.text().catch(() => '');
-    throw new Error(`Token exchange failed: ${tokenRes.status} ${err}`);
+    // SECURITY: redact any tokens in error response
+    throw new Error(`Token exchange failed: ${tokenRes.status} ${redactTokens(err)}`);
   }
 
   const tokenData = await tokenRes.json();
@@ -393,6 +450,8 @@ p{color:#8b949e;line-height:1.6}
 
 async function configureLinshare(opts) {
   if (opts.url && opts.token) {
+    // SECURITY: Validate LinShare base URL is HTTPS before storing
+    validateHttpsUrl(opts.url, 'LinShare base URL');
     setServiceConfig('linshare', {
       baseUrl: opts.url,
       jwt: opts.token,
@@ -424,6 +483,9 @@ async function configureLinshare(opts) {
       message: 'JWT token',
     },
   ]);
+
+  // SECURITY: Validate LinShare base URL is HTTPS before storing
+  validateHttpsUrl(answers.baseUrl, 'LinShare base URL');
 
   setServiceConfig('linshare', answers);
   console.log(`LinShare: connected as ${answers.username}`);

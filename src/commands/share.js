@@ -11,13 +11,17 @@ import { Command } from 'commander';
 import { readFileSync } from 'fs';
 import { basename } from 'path';
 import { getServiceConfig, isServiceConfigured } from '../config.js';
+import { validateHttpsUrl, redactTokens, USER_AGENT } from '../security.js';
 
 function requireShare() {
   if (!isServiceConfigured('linshare')) {
     console.error('LinShare not configured. Run: twake auth login --share');
     process.exit(1);
   }
-  return getServiceConfig('linshare');
+  const cfg = getServiceConfig('linshare');
+  // SECURITY: Validate LinShare base URL on every command invocation
+  validateHttpsUrl(cfg.baseUrl, 'LinShare base URL');
+  return cfg;
 }
 
 async function linshareFetch(cfg, endpoint, options = {}) {
@@ -27,13 +31,15 @@ async function linshareFetch(cfg, endpoint, options = {}) {
     headers: {
       'Authorization': `Bearer ${cfg.jwt}`,
       'Accept': 'application/json',
+      'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
       ...options.headers,
     },
   });
 
   if (!res.ok) {
     const err = await res.text().catch(() => '');
-    throw new Error(`LinShare error ${res.status}: ${err || res.statusText}`);
+    // SECURITY: redact tokens that might appear in error responses
+    throw new Error(`LinShare error ${res.status}: ${redactTokens(err || res.statusText)}`);
   }
 
   return res.json();
@@ -67,6 +73,7 @@ export function shareCommand() {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${cfg.jwt}`,
+          'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
         },
         body: form,
       });

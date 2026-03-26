@@ -12,6 +12,7 @@
  */
 
 import Conf from 'conf';
+import { chmodSync } from 'fs';
 
 const schema = {
   matrix: {
@@ -60,13 +61,31 @@ export function getServiceConfig(service) {
   return config.get(service);
 }
 
+/**
+ * SECURITY: Lock down config file permissions after every write.
+ *
+ * config.json stores tokens in plaintext. Setting mode 0600
+ * (owner read/write only) prevents other users on the same
+ * machine from reading credentials.
+ */
+function lockConfigFile() {
+  try {
+    chmodSync(config.path, 0o600);
+  } catch {
+    // Non-fatal — might fail on Windows where POSIX perms don't apply.
+    // On Unix systems this should always succeed.
+  }
+}
+
 export function setServiceConfig(service, values) {
   const current = config.get(service) || {};
   config.set(service, { ...current, ...values });
+  lockConfigFile(); // SECURITY: restrict file permissions after write
 }
 
 export function clearServiceConfig(service) {
   config.set(service, {});
+  lockConfigFile(); // SECURITY: restrict file permissions after write
 }
 
 export function isServiceConfigured(service) {

@@ -13,13 +13,17 @@ import { Command } from 'commander';
 import { readFileSync, writeFileSync } from 'fs';
 import { basename } from 'path';
 import { getServiceConfig, isServiceConfigured } from '../config.js';
+import { validateHttpsUrl, redactTokens, USER_AGENT } from '../security.js';
 
 function requireDrive() {
   if (!isServiceConfigured('cozy')) {
     console.error('Twake Drive not configured. Run: twake auth login --drive');
     process.exit(1);
   }
-  return getServiceConfig('cozy');
+  const cfg = getServiceConfig('cozy');
+  // SECURITY: Validate instance URL on every command invocation
+  validateHttpsUrl(cfg.instanceUrl, 'Cozy instance URL');
+  return cfg;
 }
 
 async function cozyFetch(cfg, endpoint, options = {}) {
@@ -30,13 +34,15 @@ async function cozyFetch(cfg, endpoint, options = {}) {
       'Authorization': `Bearer ${cfg.token}`,
       'Content-Type': 'application/vnd.api+json',
       'Accept': 'application/vnd.api+json',
+      'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
       ...options.headers,
     },
   });
 
   if (!res.ok) {
     const err = await res.text().catch(() => '');
-    throw new Error(`Cozy API error ${res.status}: ${err || res.statusText}`);
+    // SECURITY: redact tokens that might appear in error responses
+    throw new Error(`Cozy API error ${res.status}: ${redactTokens(err || res.statusText)}`);
   }
 
   return res.json();
@@ -107,6 +113,7 @@ export function driveCommand() {
         headers: {
           'Authorization': `Bearer ${cfg.token}`,
           'Content-Type': 'application/octet-stream',
+          'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
         },
         body: fileData,
       });
@@ -130,7 +137,10 @@ export function driveCommand() {
 
       const url = `${cfg.instanceUrl}/files/downloads/${id}`;
       const res = await fetch(url, {
-        headers: { 'Authorization': `Bearer ${cfg.token}` },
+        headers: {
+          'Authorization': `Bearer ${cfg.token}`,
+          'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
+        },
       });
 
       if (!res.ok) {
@@ -157,6 +167,7 @@ export function driveCommand() {
         headers: {
           'Authorization': `Bearer ${cfg.token}`,
           'Content-Type': 'application/vnd.api+json',
+          'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
         },
       });
 

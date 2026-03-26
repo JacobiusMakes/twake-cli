@@ -10,13 +10,18 @@
 
 import { Command } from 'commander';
 import { getServiceConfig, isServiceConfigured } from '../config.js';
+import { validateHttpsUrl, validateRoomId, redactTokens, safeError, USER_AGENT } from '../security.js';
 
 function requireChat() {
   if (!isServiceConfigured('matrix')) {
     console.error('Twake Chat not configured. Run: twake auth login --chat');
     process.exit(1);
   }
-  return getServiceConfig('matrix');
+  const cfg = getServiceConfig('matrix');
+  // SECURITY: Validate homeserver URL on every command invocation,
+  // in case the config was edited manually with a bad value.
+  validateHttpsUrl(cfg.homeserver, 'Matrix homeserver URL');
+  return cfg;
 }
 
 /**
@@ -31,13 +36,15 @@ async function matrixFetch(cfg, endpoint, options = {}) {
     headers: {
       'Authorization': `Bearer ${cfg.accessToken}`,
       'Content-Type': 'application/json',
+      'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
       ...options.headers,
     },
   });
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(`Matrix API error ${res.status}: ${err.error || res.statusText}`);
+    // SECURITY: redact tokens that might appear in error responses
+    throw new Error(`Matrix API error ${res.status}: ${redactTokens(err.error || res.statusText)}`);
   }
 
   return res.json();
@@ -54,7 +61,19 @@ export function chatCommand() {
     .argument('<message...>', 'Message text')
     .action(async (room, messageParts) => {
       const cfg = requireChat();
+
+      // SECURITY: Validate room ID format (must start with ! or #).
+      // Prevents sending messages to unexpected endpoints.
+      validateRoomId(room);
+
       const message = messageParts.join(' ');
+
+      /**
+       * NOTE: The message body is sent as-is to the Matrix homeserver.
+       * Matrix servers handle HTML sanitization and rendering. Client-side
+       * sanitization here would break intentional formatting. The server
+       * is the trust boundary for message content.
+       */
 
       // Resolve room alias to ID if needed
       let roomId = room;
@@ -150,6 +169,9 @@ export function chatCommand() {
     .action(async (room, opts) => {
       const cfg = requireChat();
 
+      // SECURITY: Validate room ID format before making API calls
+      validateRoomId(room);
+
       let roomId = room;
       if (room.startsWith('#')) {
         const resolved = await matrixFetch(cfg, `/directory/room/${encodeURIComponent(room)}`);
@@ -185,6 +207,9 @@ export function chatCommand() {
     .action(async (room) => {
       const cfg = requireChat();
 
+      // SECURITY: Validate room ID format before making API calls
+      validateRoomId(room);
+
       let roomId = room;
       if (room.startsWith('#')) {
         const resolved = await matrixFetch(cfg, `/directory/room/${encodeURIComponent(room)}`);
@@ -218,7 +243,8 @@ export function chatCommand() {
             }
           }
         } catch (err) {
-          console.error(`Sync error: ${err.message}. Retrying...`);
+          // SECURITY: redact tokens from sync error messages
+          safeError(`Sync error: ${err.message}. Retrying...`);
           await new Promise(r => setTimeout(r, 5000));
         }
       }

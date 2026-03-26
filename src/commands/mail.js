@@ -11,13 +11,17 @@
 
 import { Command } from 'commander';
 import { getServiceConfig, isServiceConfigured } from '../config.js';
+import { validateHttpsUrl, redactTokens, USER_AGENT } from '../security.js';
 
 function requireMail() {
   if (!isServiceConfigured('jmap')) {
     console.error('Twake Mail not configured. Run: twake auth login --mail');
     process.exit(1);
   }
-  return getServiceConfig('jmap');
+  const cfg = getServiceConfig('jmap');
+  // SECURITY: Validate JMAP session URL on every command invocation
+  validateHttpsUrl(cfg.sessionUrl, 'JMAP session URL');
+  return cfg;
 }
 
 /**
@@ -27,7 +31,10 @@ function requireMail() {
 async function jmapRequest(cfg, methodCalls, using = ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail']) {
   // First, get the session to find the API URL and account ID
   const session = await fetch(cfg.sessionUrl, {
-    headers: { 'Authorization': `Bearer ${cfg.bearerToken}` },
+    headers: {
+      'Authorization': `Bearer ${cfg.bearerToken}`,
+      'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
+    },
   }).then(r => r.json());
 
   const apiUrl = session.apiUrl;
@@ -45,12 +52,14 @@ async function jmapRequest(cfg, methodCalls, using = ['urn:ietf:params:jmap:core
     headers: {
       'Authorization': `Bearer ${cfg.bearerToken}`,
       'Content-Type': 'application/json',
+      'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
     },
     body: JSON.stringify({ using, methodCalls: calls }),
   });
 
   if (!res.ok) {
-    throw new Error(`JMAP error ${res.status}: ${res.statusText}`);
+    // SECURITY: redact tokens that might appear in error responses
+    throw new Error(`JMAP error ${res.status}: ${redactTokens(res.statusText)}`);
   }
 
   const data = await res.json();

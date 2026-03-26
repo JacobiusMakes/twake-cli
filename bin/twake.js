@@ -23,6 +23,7 @@ import { shareCommand } from '../src/commands/share.js';
 import { authCommand } from '../src/commands/auth.js';
 import { searchCommand } from '../src/commands/search.js';
 import { statusCommand } from '../src/commands/status.js';
+import { redactTokens } from '../src/security.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf-8'));
@@ -55,14 +56,19 @@ program.addCommand(shareCommand());
 // Unified search across all products
 program.addCommand(searchCommand());
 
-// Catch unhandled errors and display user-friendly messages
+/**
+ * SECURITY: Global error handlers redact tokens before logging.
+ * This is the last line of defense — if any command accidentally
+ * includes a token in an error message, it gets stripped here
+ * before reaching the user's terminal / log files.
+ */
 process.on('uncaughtException', (err) => {
-  console.error(`\nError: ${err.message}`);
+  console.error(`\nError: ${redactTokens(err.message)}`);
   process.exit(1);
 });
 
 process.on('unhandledRejection', (err) => {
-  console.error(`\nError: ${err.message || err}`);
+  console.error(`\nError: ${redactTokens(err?.message || String(err))}`);
   process.exit(1);
 });
 

@@ -9,6 +9,58 @@ A unified CLI for interacting with Linagora's open-source collaboration suite. B
 - **Twake Drive** via the [Cozy](https://cozy.io) API
 - **LinShare** via the LinShare REST API
 
+## Demo
+
+```
+$ twake auth whoami
+Twake CLI — Service connections:
+
+  ✓ Twake Chat     connected (@jacob:twake.app)
+  ✓ Twake Mail     connected (https://jmap.twake.app/jmap/session)
+  ✓ Twake Drive    connected (https://jacob.twake.app)
+  ✗ LinShare       not configured
+
+$ twake chat rooms
+Joined rooms (1):
+
+  twake-cli-dev                  !JIdHIALrfERppYiLhI:twake.app
+
+$ twake chat send '!JIdHIALrfERppYiLhI:twake.app' 'Hello from twake-cli!'
+Message sent to !JIdHIALrfERppYiLhI:twake.app
+
+$ twake drive ls
+  /Administrative
+  /Photos
+   demo-file.txt
+
+$ twake drive upload ./report.pdf
+Uploaded report.pdf (14.2 KB)
+  ID: 019d288c-c353-7d8c-b857-890b351dfe15
+
+$ twake mail mailboxes
+Mailboxes:
+
+  INBOX (inbox) — 1 total
+  Sent (sent) — 1 total
+  Drafts (drafts) — 0 total
+  Trash (trash) — 0 total
+
+$ twake search "quarterly report"
+Searching for "quarterly report"...
+
+--- Twake Chat (2 results) ---
+  [3/26/2026, 9:15 AM] alice: The quarterly report is in Drive
+  [3/25/2026, 4:30 PM] jacob: Uploading quarterly report now
+
+--- Twake Mail (1 results) ---
+  3/26/2026  finance@company.com          Q1 Quarterly Report - Final
+
+--- Twake Drive (1 results) ---
+  quarterly-report-q1.pdf  (2.1 MB)  modified 3/26/2026
+```
+
+All commands hit **live Twake Workplace infrastructure** — no mocks, no stubs.
+
 ## Why?
 
 Every major collaboration platform has a CLI — Slack, GitHub, Vercel, AWS. Twake Workplace deserves one too. `twake-cli` gives developers and power users terminal-native access to the entire Twake ecosystem, and enables scripting, automation, and CI/CD integration with open-source collaboration tools.
@@ -16,13 +68,7 @@ Every major collaboration platform has a CLI — Slack, GitHub, Vercel, AWS. Twa
 ## Install
 
 ```bash
-npm install -g @linagora/twake-cli
-```
-
-Or clone and link locally:
-
-```bash
-git clone https://github.com/jacob/twake-cli.git
+git clone https://github.com/JacobiusMakes/twake-cli.git
 cd twake-cli
 npm install
 npm link
@@ -33,11 +79,14 @@ Requires Node.js >= 18.
 ## Quick start
 
 ```bash
-# Connect your services
-twake auth login
+# Authenticate with Twake Chat (opens browser for SSO)
+twake auth login --chat
+
+# Authenticate with Twake Drive (Cozy OAuth flow)
+twake auth login --drive
 
 # Check what's connected
-twake status
+twake auth whoami
 
 # Send a chat message
 twake chat send '#general:twake.app' "Hello from the terminal!"
@@ -47,9 +96,6 @@ twake mail inbox
 
 # Upload a file
 twake drive upload ./report.pdf
-
-# Share a file with someone
-twake share send ./contract.pdf --to partner@company.com --expires 7d
 
 # Search across everything
 twake search "Q3 budget"
@@ -124,31 +170,45 @@ twake search "architecture diagram" --only drive
 
 Credentials are stored in `~/.config/twake-cli/config.json`. The file contains access tokens — keep it secure (`chmod 600`).
 
+## Security
+
+Tokens are stored locally with `0600` file permissions (owner-only). All commands:
+
+- Validate HTTPS URLs before making requests
+- Redact tokens from error messages (global + per-command)
+- Use timing-safe comparison for OAuth state parameters
+- Rate-limit local OAuth callback servers (single-use)
+- Send a `User-Agent` header identifying `twake-cli`
+
+See [`src/security.js`](src/security.js) for the full security module.
+
 ## Architecture
 
 ```
 twake-cli/
 ├── bin/twake.js          # Entry point & command routing
 ├── src/
-│   ├── config.js         # Config manager (~/.config/twake-cli/)
+│   ├── config.js         # Config manager (token storage, 0600 perms)
+│   ├── security.js       # Security utilities (redaction, validation)
 │   └── commands/
-│       ├── auth.js       # Auth setup & credential management
+│       ├── auth.js       # SSO & OAuth flows (Matrix, Cozy, OIDC)
 │       ├── chat.js       # Matrix client-server API
-│       ├── mail.js       # JMAP protocol implementation
+│       ├── mail.js       # JMAP protocol (RFC 8620/8621)
 │       ├── drive.js      # Cozy API for file management
 │       ├── share.js      # LinShare REST API
 │       ├── search.js     # Unified cross-product search
 │       └── status.js     # Connection status overview
+├── demo.sh               # Interactive demo script
 └── package.json
 ```
 
-Each command module is self-contained with its own API client, making it easy to add new services or swap implementations.
+Each command module is self-contained with its own API client. Auth flows use browser-based SSO/OAuth with local callback servers — no passwords stored.
 
 ## Open source
 
 Licensed under AGPL-3.0 to match Linagora's licensing. Contributions welcome.
 
-Built with admiration for Linagora's mission of digital sovereignty and open-source collaboration tools for Europe.
+Built with respect for Linagora's mission of digital sovereignty and open-source collaboration tools for Europe.
 
 ## Roadmap
 
