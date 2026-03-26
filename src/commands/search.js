@@ -154,25 +154,42 @@ async function searchMail(query, limit) {
 
 async function searchDrive(query, limit) {
   const cfg = getServiceConfig('cozy');
+  const lowerQuery = query.toLowerCase();
 
   try {
-    const res = await fetch(`${cfg.instanceUrl}/files/_find`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${cfg.token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        selector: { name: { '$regex': `(?i)${query}` } },
-        limit,
-      }),
-    }).then(r => r.json());
+    // Recursively collect files starting from root
+    const allFiles = [];
+    const dirs = ['io.cozy.files.root-dir'];
 
-    const files = res.data || [];
+    while (dirs.length > 0 && allFiles.length < 100) {
+      const dirId = dirs.shift();
+      const res = await fetch(`${cfg.instanceUrl}/files/${dirId}`, {
+        headers: {
+          'Authorization': `Bearer ${cfg.token}`,
+          'Accept': 'application/vnd.api+json',
+        },
+      });
 
-    if (files.length) {
-      console.log(`--- Twake Drive (${files.length} results) ---\n`);
-      for (const f of files) {
+      if (!res.ok) continue;
+      const data = await res.json();
+      const contents = data.included || [];
+
+      for (const item of contents) {
+        const attrs = item.attributes || {};
+        if (attrs.type === 'directory') {
+          dirs.push(item.id);
+        }
+        if (attrs.name?.toLowerCase().includes(lowerQuery)) {
+          allFiles.push(item);
+        }
+      }
+    }
+
+    const matches = allFiles.slice(0, limit);
+
+    if (matches.length) {
+      console.log(`--- Twake Drive (${matches.length} results) ---\n`);
+      for (const f of matches) {
         const attrs = f.attributes || {};
         const type = attrs.type === 'directory' ? 'folder' : 'file';
         console.log(`  [${type}] ${attrs.name || f.id}`);
@@ -180,7 +197,7 @@ async function searchDrive(query, limit) {
       console.log('');
     }
 
-    return { count: files.length };
+    return { count: matches.length };
   } catch (err) {
     console.log(`--- Twake Drive: search failed (${err.message}) ---\n`);
     return { count: 0 };
