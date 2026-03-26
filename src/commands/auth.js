@@ -12,6 +12,7 @@
  */
 
 import { Command } from 'commander';
+import { createServer } from 'http';
 import { setServiceConfig, clearServiceConfig, isServiceConfigured, getServiceConfig, getConfigPath } from '../config.js';
 
 export function authCommand() {
@@ -92,7 +93,7 @@ export function authCommand() {
 }
 
 async function configureMatrix(opts) {
-  // In non-interactive mode, use flags directly
+  // Direct token mode (CI/scripting fallback)
   if (opts.homeserver && opts.token) {
     setServiceConfig('matrix', {
       homeserver: opts.homeserver,
@@ -103,35 +104,111 @@ async function configureMatrix(opts) {
     return;
   }
 
-  // Interactive mode — dynamic import enquirer only when needed
   const { default: Enquirer } = await import('enquirer');
   const prompt = Enquirer.prompt.bind(Enquirer);
 
-  console.log('\n--- Twake Chat (Matrix) ---');
-  console.log('Get your access token from Twake Chat settings or Element.\n');
+  console.log('\n--- Twake Chat (Matrix) ---\n');
 
-  const answers = await prompt([
+  const { homeserver } = await prompt([
     {
       type: 'input',
       name: 'homeserver',
       message: 'Matrix homeserver URL',
       initial: 'https://matrix.twake.app',
     },
-    {
-      type: 'input',
-      name: 'userId',
-      message: 'Your Matrix user ID',
-      initial: '@you:twake.app',
-    },
-    {
-      type: 'password',
-      name: 'accessToken',
-      message: 'Access token',
-    },
   ]);
 
-  setServiceConfig('matrix', answers);
-  console.log(`Twake Chat: connected as ${answers.userId}`);
+  // Start local server to receive SSO callback
+  const port = 8932;
+  const redirectUrl = `http://localhost:${port}/callback`;
+
+  const loginToken = await new Promise((resolve, reject) => {
+    const server = createServer((req, res) => {
+      const url = new URL(req.url, `http://localhost:${port}`);
+
+      if (url.pathname === '/callback') {
+        const token = url.searchParams.get('loginToken');
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>twake-cli</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{min-height:100vh;display:flex;align-items:center;justify-content:center;
+font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background:#0d1117;color:#e6edf3}
+.card{text-align:center;padding:3rem;border-radius:16px;
+background:linear-gradient(145deg,#161b22,#1c2333);
+border:1px solid #30363d;box-shadow:0 8px 32px rgba(0,0,0,.4);max-width:420px}
+.check{width:64px;height:64px;margin:0 auto 1.5rem;border-radius:50%;
+background:#238636;display:flex;align-items:center;justify-content:center;
+animation:pop .4s cubic-bezier(.34,1.56,.64,1)}
+.check svg{width:32px;height:32px}
+h1{font-size:1.5rem;font-weight:600;margin-bottom:.5rem}
+p{color:#8b949e;line-height:1.6}
+.closing{margin-top:1.5rem;font-size:.85rem;color:#58a6ff}
+@keyframes pop{0%{transform:scale(0)}100%{transform:scale(1)}}
+</style></head><body>
+<div class="card">
+<div class="check"><svg fill="none" stroke="#fff" stroke-width="3" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg></div>
+<h1>Logged in to twake-cli</h1>
+<p>You're authenticated. Return to your terminal.</p>
+<p class="closing">You can close this tab now.</p>
+</div>
+</body></html>`);
+        server.close();
+
+        if (token) {
+          resolve(token);
+        } else {
+          reject(new Error('No loginToken received from SSO callback'));
+        }
+      }
+    });
+
+    server.listen(port, () => {
+      const ssoUrl = `${homeserver}/_matrix/client/v3/login/sso/redirect/oidc-twake?redirectUrl=${encodeURIComponent(redirectUrl)}`;
+
+      console.log('Opening browser for Twake SSO login...');
+      console.log(`If it doesn't open, go to:\n  ${ssoUrl}\n`);
+
+      // Open browser (macOS)
+      import('child_process').then(({ exec }) => {
+        exec(`open "${ssoUrl}"`);
+      });
+    });
+
+    // Timeout after 2 minutes
+    setTimeout(() => {
+      server.close();
+      reject(new Error('SSO login timed out after 2 minutes'));
+    }, 120000);
+  });
+
+  // Exchange login token for access token
+  const res = await fetch(`${homeserver}/_matrix/client/v3/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      type: 'm.login.token',
+      token: loginToken,
+      initial_device_display_name: 'twake-cli',
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(`Token exchange failed: ${err.error || res.statusText}`);
+  }
+
+  const data = await res.json();
+
+  setServiceConfig('matrix', {
+    homeserver,
+    accessToken: data.access_token,
+    userId: data.user_id,
+    deviceId: data.device_id,
+  });
+
+  console.log(`Twake Chat: logged in as ${data.user_id} (device: ${data.device_id})`);
 }
 
 async function configureJmap(opts) {
