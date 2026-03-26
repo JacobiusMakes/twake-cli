@@ -20,9 +20,19 @@ export function searchCommand() {
     .argument('<query...>', 'Search terms')
     .option('--only <service>', 'Limit to: chat, mail, drive, share')
     .option('-n, --limit <count>', 'Max results per service', '5')
+    .option('--server <url>', 'Use twake-search service', 'http://127.0.0.1:3200')
+    .option('--local', 'Force local search (skip twake-search service)')
     .action(async (queryParts, opts) => {
       const query = queryParts.join(' ');
       const limit = parseInt(opts.limit);
+
+      // Try twake-search service first (if running)
+      if (!opts.local) {
+        try {
+          const serverResult = await searchViaServer(query, opts.server, limit, opts.only);
+          if (serverResult) return;
+        } catch { /* server not running, fall back to local */ }
+      }
 
       console.log(`Searching for "${query}"...\n`);
 
@@ -62,6 +72,69 @@ export function searchCommand() {
     });
 
   return search;
+}
+
+/**
+ * Proxy search through twake-search service (if running).
+ * Returns true if the server responded, false if unavailable.
+ */
+async function searchViaServer(query, serverUrl, limit, only) {
+  const url = new URL('/search', serverUrl);
+  url.searchParams.set('q', query);
+  url.searchParams.set('limit', limit);
+  if (only) url.searchParams.set('sources', only);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2000);
+
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { 'User-Agent': USER_AGENT },
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) return false;
+    const data = await res.json();
+
+    console.log(`Searching for "${query}" (via twake-search)...\n`);
+
+    if (!data.results?.length) {
+      console.log('No results found.');
+      return true;
+    }
+
+    // Group results by source
+    const grouped = {};
+    for (const r of data.results) {
+      if (!grouped[r.source]) grouped[r.source] = [];
+      grouped[r.source].push(r);
+    }
+
+    const sourceNames = { chat: 'Twake Chat', mail: 'Twake Mail', drive: 'Twake Drive', share: 'LinShare' };
+
+    for (const [source, results] of Object.entries(grouped)) {
+      console.log(`--- ${sourceNames[source] || source} (${results.length} results) ---\n`);
+
+      for (const r of results) {
+        const date = r.timestamp ? new Date(r.timestamp).toLocaleString() : '';
+        if (source === 'chat') {
+          console.log(`  [${date}] ${r.author}: ${r.snippet || r.title}`);
+        } else if (source === 'mail') {
+          console.log(`  ${date}  ${(r.author || '').padEnd(28)} ${r.title}`);
+        } else {
+          console.log(`  ${r.title}  ${r.snippet ? `— ${r.snippet.slice(0, 60)}` : ''}`);
+        }
+      }
+      console.log('');
+    }
+
+    console.log(`(${data.total} total results in ${data.queryTimeMs}ms)`);
+    return true;
+  } catch {
+    clearTimeout(timeout);
+    return false;
+  }
 }
 
 async function searchChat(query, limit) {
