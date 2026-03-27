@@ -9,7 +9,7 @@
   "scripts": {
     "start": "node bin/twake.js",
     "lint": "eslint src/",
-    "test": "node --test test/"
+    "test": "node --test test/*.test.js"
   },
   "keywords": [
     "twake",
