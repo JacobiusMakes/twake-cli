@@ -331,96 +331,112 @@ async function configureJmap(opts) {
     throw new Error('OIDC discovery response missing authorization_endpoint or token_endpoint');
   }
 
+  /**
+   * Headless OIDC flow — authenticate directly via LemonLDAP's REST API.
+   *
+   * This approach comes from Linagora's own `simple-oidc-client` tool
+   * (github.com/linagora/simple-oidc-client). It works without a browser
+   * redirect, which is essential because the production LemonLDAP only
+   * allows specific redirect URIs (mail.twake.app), not localhost.
+   *
+   * Flow:
+   * 1. POST username/password to LemonLDAP → get session cookie
+   * 2. Use session cookie to hit authorize endpoint (no redirect needed)
+   * 3. Extract auth code from the 302 Location header
+   * 4. Exchange code for access token via PKCE
+   */
+
   // PKCE: Generate code_verifier and code_challenge
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
 
-  const port = 8934;
-  const redirectUri = `http://localhost:${port}/callback`;
-  const state = randomBytes(16).toString('hex');
   const clientId = 'james';
   const scope = 'openid profile email offline_access';
+  // Use a dummy redirect URI — we never actually navigate to it,
+  // we just read the code from the 302 Location header.
+  const redirectUri = 'http://localhost/callback';
 
-  const authCode = await new Promise((resolve, reject) => {
-    let callbackHandled = false;
+  // Step 1: Authenticate with LemonLDAP to get a session cookie
+  const { username, password } = await prompt([
+    {
+      type: 'input',
+      name: 'username',
+      message: 'Twake email/username',
+    },
+    {
+      type: 'password',
+      name: 'password',
+      message: 'Password',
+    },
+  ]);
 
-    const server = createServer((req, res) => {
-      const url = new URL(req.url, `http://localhost:${port}`);
+  console.log('Authenticating with Twake SSO...');
 
-      if (callbackHandled) {
-        res.writeHead(403, { 'Content-Type': 'text/plain' });
-        res.end('Forbidden — callback already processed.');
-        return;
-      }
-
-      if (url.pathname === '/callback') {
-        callbackHandled = true;
-        const code = url.searchParams.get('code');
-        const returnedState = url.searchParams.get('state');
-        const error = url.searchParams.get('error');
-
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>twake-cli</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{min-height:100vh;display:flex;align-items:center;justify-content:center;
-font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-background:#0d1117;color:#e6edf3}
-.card{text-align:center;padding:3rem;border-radius:16px;
-background:linear-gradient(145deg,#161b22,#1c2333);
-border:1px solid #30363d;box-shadow:0 8px 32px rgba(0,0,0,.4);max-width:420px}
-.check{width:64px;height:64px;margin:0 auto 1.5rem;border-radius:50%;
-background:#238636;display:flex;align-items:center;justify-content:center;
-animation:pop .4s cubic-bezier(.34,1.56,.64,1)}
-.check svg{width:32px;height:32px}
-h1{font-size:1.5rem;font-weight:600;margin-bottom:.5rem}
-p{color:#8b949e;line-height:1.6}
-.closing{margin-top:1.5rem;font-size:.85rem;color:#58a6ff}
-@keyframes pop{0%{transform:scale(0)}100%{transform:scale(1)}}
-</style></head><body>
-<div class="card">
-<div class="check"><svg fill="none" stroke="#fff" stroke-width="3" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg></div>
-<h1>Twake Mail connected</h1>
-<p>twake-cli can now access your email via JMAP. Return to your terminal.</p>
-<p class="closing">You can close this tab now.</p>
-</div></body></html>`);
-        server.close();
-
-        if (error) {
-          reject(new Error(`OIDC authorization error: ${error}`));
-        } else if (code && timingSafeCompare(returnedState, state)) {
-          resolve(code);
-        } else {
-          reject(new Error('OIDC callback missing code or state mismatch'));
-        }
-      }
-    });
-
-    server.listen(port, () => {
-      const authUrl = new URL(authEndpoint);
-      authUrl.searchParams.set('response_type', 'code');
-      authUrl.searchParams.set('client_id', clientId);
-      authUrl.searchParams.set('redirect_uri', redirectUri);
-      authUrl.searchParams.set('scope', scope);
-      authUrl.searchParams.set('state', state);
-      authUrl.searchParams.set('code_challenge', codeChallenge);
-      authUrl.searchParams.set('code_challenge_method', 'S256');
-
-      console.log('Opening browser for Twake Mail SSO login...');
-      console.log(`If it doesn't open, go to:\n  ${authUrl.toString()}\n`);
-
-      import('child_process').then(({ exec }) => {
-        exec(`open "${authUrl.toString()}"`);
-      });
-    });
-
-    setTimeout(() => {
-      server.close();
-      reject(new Error('OIDC login timed out after 2 minutes'));
-    }, 120000);
+  const loginRes = await fetch(oidcProviderUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Accept': 'application/json',
+      'User-Agent': USER_AGENT,
+    },
+    body: new URLSearchParams({ user: username, password }),
+    redirect: 'manual', // Don't follow redirects
   });
 
-  // Exchange auth code for access token using PKCE
+  // LemonLDAP returns a session cookie on success
+  const setCookies = loginRes.headers.getSetCookie?.() || [];
+  const lemonCookie = setCookies
+    .map(c => c.split(';')[0])
+    .find(c => c.startsWith('lemonldap='));
+
+  if (!lemonCookie) {
+    // Check if we got a JSON error
+    const body = await loginRes.text().catch(() => '');
+    if (body.includes('error')) {
+      throw new Error('SSO login failed — check your username and password');
+    }
+    throw new Error('SSO login failed — no session cookie received');
+  }
+
+  console.log('SSO session: OK');
+
+  // Step 2: Request authorization code using the session cookie
+  const authUrl = new URL(authEndpoint);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('client_id', clientId);
+  authUrl.searchParams.set('redirect_uri', redirectUri);
+  authUrl.searchParams.set('scope', scope);
+  authUrl.searchParams.set('code_challenge', codeChallenge);
+  authUrl.searchParams.set('code_challenge_method', 'S256');
+
+  const authorizeRes = await fetch(authUrl.toString(), {
+    headers: {
+      'Cookie': lemonCookie,
+      'User-Agent': USER_AGENT,
+    },
+    redirect: 'manual', // Don't follow the redirect — we need the Location header
+  });
+
+  // The 302 Location header contains our auth code
+  const location = authorizeRes.headers.get('location');
+  if (!location) {
+    throw new Error('OIDC authorize did not return a redirect. The SSO session may have expired.');
+  }
+
+  const callbackUrl = new URL(location);
+  const authCode = callbackUrl.searchParams.get('code');
+  const error = callbackUrl.searchParams.get('error');
+
+  if (error) {
+    throw new Error(`OIDC authorization error: ${error} — ${callbackUrl.searchParams.get('error_description') || ''}`);
+  }
+  if (!authCode) {
+    throw new Error('OIDC authorize redirect did not contain an authorization code');
+  }
+
+  console.log('Authorization code: OK');
+
+  // Step 3: Exchange auth code for access token using PKCE
   const tokenRes = await fetch(tokenEndpoint, {
     method: 'POST',
     headers: {
