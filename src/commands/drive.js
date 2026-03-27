@@ -10,8 +10,8 @@
  */
 
 import { Command } from 'commander';
-import { readFileSync, writeFileSync } from 'fs';
-import { basename } from 'path';
+import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, mkdirSync } from 'fs';
+import { basename, join, relative } from 'path';
 import { getServiceConfig, isServiceConfigured } from '../config.js';
 import { validateHttpsUrl, redactTokens, USER_AGENT } from '../security.js';
 
@@ -177,6 +177,173 @@ export function driveCommand() {
 
       const data = await res.json();
       console.log(`Created folder "${name}" (${data.data?.id})`);
+    });
+
+  drive
+    .command('sync')
+    .description('Sync a local folder with Twake Drive')
+    .argument('<local>', 'Local folder path')
+    .option('--remote <id>', 'Remote folder ID', 'io.cozy.files.root-dir')
+    .option('--dry-run', 'Show what would be synced without making changes', false)
+    .option('--direction <dir>', 'Sync direction: up (local→remote), down (remote→local), both', 'both')
+    .action(async (localPath, opts) => {
+      const cfg = requireDrive();
+
+      if (!existsSync(localPath)) {
+        if (opts.direction === 'down' || opts.direction === 'both') {
+          mkdirSync(localPath, { recursive: true });
+          console.log(`Created local folder: ${localPath}`);
+        } else {
+          console.error(`Local folder not found: ${localPath}`);
+          process.exit(1);
+        }
+      }
+
+      console.log(`Syncing ${localPath} ↔ Twake Drive (${opts.remote})`);
+      if (opts.dryRun) console.log('  (dry run — no changes will be made)\n');
+      else console.log('');
+
+      // Get remote file listing
+      const remoteData = await cozyFetch(cfg, `/files/${opts.remote}`);
+      const remoteFiles = (remoteData.included || []).map(item => ({
+        id: item.id,
+        name: item.attributes?.name || item.id,
+        type: item.attributes?.type,
+        size: item.attributes?.size || 0,
+        updated: item.attributes?.updated_at ? new Date(item.attributes.updated_at) : new Date(0),
+      }));
+
+      const remoteFileMap = new Map(remoteFiles.map(f => [f.name, f]));
+
+      // Get local file listing (non-recursive for now)
+      const localFiles = readdirSync(localPath)
+        .filter(name => !name.startsWith('.'))
+        .map(name => {
+          const fullPath = join(localPath, name);
+          const stat = statSync(fullPath);
+          return {
+            name,
+            path: fullPath,
+            isDir: stat.isDirectory(),
+            size: stat.size,
+            modified: stat.mtime,
+          };
+        })
+        .filter(f => !f.isDir); // Files only for now
+
+      const localFileMap = new Map(localFiles.map(f => [f.name, f]));
+
+      let uploaded = 0, downloaded = 0, skipped = 0;
+
+      // Upload: local files missing from remote
+      if (opts.direction === 'up' || opts.direction === 'both') {
+        for (const local of localFiles) {
+          const remote = remoteFileMap.get(local.name);
+
+          if (!remote) {
+            // File exists locally but not remotely → upload
+            if (opts.dryRun) {
+              console.log(`  ↑ UPLOAD  ${local.name} (${formatBytes(local.size)})`);
+            } else {
+              const fileData = readFileSync(local.path);
+              const url = `${cfg.instanceUrl}/files/${opts.remote}?Type=file&Name=${encodeURIComponent(local.name)}`;
+              const res = await fetch(url, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${cfg.token}`,
+                  'Content-Type': 'application/octet-stream',
+                  'User-Agent': USER_AGENT,
+                },
+                body: fileData,
+              });
+              if (res.ok) {
+                console.log(`  ↑ uploaded ${local.name} (${formatBytes(local.size)})`);
+                uploaded++;
+              } else {
+                console.error(`  ✗ failed to upload ${local.name}: ${res.status}`);
+              }
+            }
+          } else if (local.modified > remote.updated && local.size !== remote.size) {
+            // Local is newer and different size → upload (overwrite)
+            if (opts.dryRun) {
+              console.log(`  ↑ UPDATE  ${local.name} (local newer)`);
+            } else {
+              // Delete remote, re-upload (Cozy doesn't have a simple overwrite)
+              try {
+                await fetch(`${cfg.instanceUrl}/files/${remote.id}`, {
+                  method: 'DELETE',
+                  headers: { 'Authorization': `Bearer ${cfg.token}`, 'User-Agent': USER_AGENT },
+                });
+              } catch { /* ignore delete failures */ }
+
+              const fileData = readFileSync(local.path);
+              const url = `${cfg.instanceUrl}/files/${opts.remote}?Type=file&Name=${encodeURIComponent(local.name)}`;
+              const res = await fetch(url, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${cfg.token}`,
+                  'Content-Type': 'application/octet-stream',
+                  'User-Agent': USER_AGENT,
+                },
+                body: fileData,
+              });
+              if (res.ok) {
+                console.log(`  ↑ updated ${local.name}`);
+                uploaded++;
+              }
+            }
+          } else {
+            skipped++;
+          }
+        }
+      }
+
+      // Download: remote files missing locally
+      if (opts.direction === 'down' || opts.direction === 'both') {
+        for (const remote of remoteFiles) {
+          if (remote.type === 'directory') continue; // Skip dirs for now
+
+          const local = localFileMap.get(remote.name);
+
+          if (!local) {
+            // File exists remotely but not locally → download
+            if (opts.dryRun) {
+              console.log(`  ↓ DOWNLOAD  ${remote.name} (${formatBytes(remote.size)})`);
+            } else {
+              const dlRes = await fetch(`${cfg.instanceUrl}/files/downloads/${remote.id}`, {
+                headers: { 'Authorization': `Bearer ${cfg.token}`, 'User-Agent': USER_AGENT },
+              });
+              if (dlRes.ok) {
+                const buffer = Buffer.from(await dlRes.arrayBuffer());
+                writeFileSync(join(localPath, remote.name), buffer);
+                console.log(`  ↓ downloaded ${remote.name} (${formatBytes(buffer.length)})`);
+                downloaded++;
+              } else {
+                console.error(`  ✗ failed to download ${remote.name}: ${dlRes.status}`);
+              }
+            }
+          } else if (remote.updated > local.modified && remote.size !== local.size) {
+            // Remote is newer → download
+            if (opts.dryRun) {
+              console.log(`  ↓ UPDATE  ${remote.name} (remote newer)`);
+            } else {
+              const dlRes = await fetch(`${cfg.instanceUrl}/files/downloads/${remote.id}`, {
+                headers: { 'Authorization': `Bearer ${cfg.token}`, 'User-Agent': USER_AGENT },
+              });
+              if (dlRes.ok) {
+                const buffer = Buffer.from(await dlRes.arrayBuffer());
+                writeFileSync(join(localPath, remote.name), buffer);
+                console.log(`  ↓ updated ${remote.name}`);
+                downloaded++;
+              }
+            }
+          } else {
+            skipped++;
+          }
+        }
+      }
+
+      console.log(`\nSync complete: ${uploaded} uploaded, ${downloaded} downloaded, ${skipped} unchanged`);
     });
 
   return drive;
