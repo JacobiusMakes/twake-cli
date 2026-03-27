@@ -238,8 +238,8 @@ p{color:#8b949e;line-height:1.6}
 }
 
 async function configureJmap(opts) {
+  // Direct token mode (CI/scripting fallback)
   if (opts.url && opts.token) {
-    // SECURITY: Validate JMAP session URL is HTTPS before storing
     validateHttpsUrl(opts.url, 'JMAP session URL');
     setServiceConfig('jmap', {
       sessionUrl: opts.url,
@@ -251,29 +251,207 @@ async function configureJmap(opts) {
 
   const { default: Enquirer } = await import('enquirer');
   const prompt = Enquirer.prompt.bind(Enquirer);
+  const { randomBytes, createHash } = await import('crypto');
 
-  console.log('\n--- Twake Mail (JMAP) ---');
-  console.log('JMAP session URL is typically: https://your-twake.example.com/.well-known/jmap\n');
+  console.log('\n--- Twake Mail (JMAP via OIDC) ---\n');
 
-  const answers = await prompt([
+  const { jmapUrl } = await prompt([
     {
       type: 'input',
-      name: 'sessionUrl',
-      message: 'JMAP session URL',
-      initial: 'https://jmap.twake.app/.well-known/jmap',
-    },
-    {
-      type: 'password',
-      name: 'bearerToken',
-      message: 'Bearer token',
+      name: 'jmapUrl',
+      message: 'JMAP server URL',
+      initial: 'https://jmap.twake.app',
     },
   ]);
 
-  // SECURITY: Validate JMAP session URL is HTTPS before storing
-  validateHttpsUrl(answers.sessionUrl, 'JMAP session URL');
+  validateHttpsUrl(jmapUrl, 'JMAP server URL');
 
-  setServiceConfig('jmap', answers);
-  console.log('Twake Mail: connected');
+  /**
+   * JMAP auth uses OIDC via LemonLDAP (Twake's SSO provider).
+   *
+   * The flow:
+   * 1. Discover the OIDC provider URL from the JMAP server's well-known endpoint
+   * 2. Use PKCE (Proof Key for Code Exchange) for security
+   * 3. Open browser to LemonLDAP's authorization endpoint
+   * 4. Receive auth code at local callback server
+   * 5. Exchange code for access token
+   * 6. Use access token as Bearer token for JMAP requests
+   *
+   * Config discovered from linagora/twake-workplace-docker:
+   * - OIDC client ID: "james"
+   * - OIDC provider: auth.{domain} (LemonLDAP::NG)
+   * - Scopes: openid, profile, email
+   */
+
+  // Derive the SSO domain from the JMAP domain.
+  // Production Twake uses sso.twake.app (LemonLDAP::NG).
+  // Self-hosted instances may use auth.{domain}.
+  const jmapHost = new URL(jmapUrl).hostname;
+  const baseDomain = jmapHost.replace(/^jmap\./, '');
+
+  // Try sso.{domain} first (production), fall back to auth.{domain}
+  let oidcProviderUrl;
+  for (const prefix of ['sso', 'auth']) {
+    const candidate = `https://${prefix}.${baseDomain}`;
+    try {
+      const probe = await fetch(`${candidate}/.well-known/openid-configuration`, {
+        headers: { 'User-Agent': USER_AGENT },
+      });
+      if (probe.ok) {
+        oidcProviderUrl = candidate;
+        break;
+      }
+    } catch {
+      // Try next candidate
+    }
+  }
+  if (!oidcProviderUrl) {
+    throw new Error(`Could not discover OIDC provider at sso.${baseDomain} or auth.${baseDomain}`);
+  }
+
+  console.log(`OIDC provider: ${oidcProviderUrl}`);
+
+  // Discover OIDC endpoints
+  let oidcConfig;
+  try {
+    const discoveryRes = await fetch(`${oidcProviderUrl}/.well-known/openid-configuration`, {
+      headers: { 'User-Agent': USER_AGENT },
+    });
+    if (!discoveryRes.ok) throw new Error(`HTTP ${discoveryRes.status}`);
+    oidcConfig = await discoveryRes.json();
+    console.log('OIDC discovery: OK');
+  } catch (err) {
+    throw new Error(`OIDC discovery failed at ${oidcProviderUrl}: ${redactTokens(err.message)}`);
+  }
+
+  const authEndpoint = oidcConfig.authorization_endpoint;
+  const tokenEndpoint = oidcConfig.token_endpoint;
+
+  if (!authEndpoint || !tokenEndpoint) {
+    throw new Error('OIDC discovery response missing authorization_endpoint or token_endpoint');
+  }
+
+  // PKCE: Generate code_verifier and code_challenge
+  const codeVerifier = randomBytes(32).toString('base64url');
+  const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
+
+  const port = 8934;
+  const redirectUri = `http://localhost:${port}/callback`;
+  const state = randomBytes(16).toString('hex');
+  const clientId = 'james';
+  const scope = 'openid profile email offline_access';
+
+  const authCode = await new Promise((resolve, reject) => {
+    let callbackHandled = false;
+
+    const server = createServer((req, res) => {
+      const url = new URL(req.url, `http://localhost:${port}`);
+
+      if (callbackHandled) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('Forbidden — callback already processed.');
+        return;
+      }
+
+      if (url.pathname === '/callback') {
+        callbackHandled = true;
+        const code = url.searchParams.get('code');
+        const returnedState = url.searchParams.get('state');
+        const error = url.searchParams.get('error');
+
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>twake-cli</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{min-height:100vh;display:flex;align-items:center;justify-content:center;
+font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background:#0d1117;color:#e6edf3}
+.card{text-align:center;padding:3rem;border-radius:16px;
+background:linear-gradient(145deg,#161b22,#1c2333);
+border:1px solid #30363d;box-shadow:0 8px 32px rgba(0,0,0,.4);max-width:420px}
+.check{width:64px;height:64px;margin:0 auto 1.5rem;border-radius:50%;
+background:#238636;display:flex;align-items:center;justify-content:center;
+animation:pop .4s cubic-bezier(.34,1.56,.64,1)}
+.check svg{width:32px;height:32px}
+h1{font-size:1.5rem;font-weight:600;margin-bottom:.5rem}
+p{color:#8b949e;line-height:1.6}
+.closing{margin-top:1.5rem;font-size:.85rem;color:#58a6ff}
+@keyframes pop{0%{transform:scale(0)}100%{transform:scale(1)}}
+</style></head><body>
+<div class="card">
+<div class="check"><svg fill="none" stroke="#fff" stroke-width="3" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg></div>
+<h1>Twake Mail connected</h1>
+<p>twake-cli can now access your email via JMAP. Return to your terminal.</p>
+<p class="closing">You can close this tab now.</p>
+</div></body></html>`);
+        server.close();
+
+        if (error) {
+          reject(new Error(`OIDC authorization error: ${error}`));
+        } else if (code && timingSafeCompare(returnedState, state)) {
+          resolve(code);
+        } else {
+          reject(new Error('OIDC callback missing code or state mismatch'));
+        }
+      }
+    });
+
+    server.listen(port, () => {
+      const authUrl = new URL(authEndpoint);
+      authUrl.searchParams.set('response_type', 'code');
+      authUrl.searchParams.set('client_id', clientId);
+      authUrl.searchParams.set('redirect_uri', redirectUri);
+      authUrl.searchParams.set('scope', scope);
+      authUrl.searchParams.set('state', state);
+      authUrl.searchParams.set('code_challenge', codeChallenge);
+      authUrl.searchParams.set('code_challenge_method', 'S256');
+
+      console.log('Opening browser for Twake Mail SSO login...');
+      console.log(`If it doesn't open, go to:\n  ${authUrl.toString()}\n`);
+
+      import('child_process').then(({ exec }) => {
+        exec(`open "${authUrl.toString()}"`);
+      });
+    });
+
+    setTimeout(() => {
+      server.close();
+      reject(new Error('OIDC login timed out after 2 minutes'));
+    }, 120000);
+  });
+
+  // Exchange auth code for access token using PKCE
+  const tokenRes = await fetch(tokenEndpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': USER_AGENT,
+    },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code: authCode,
+      redirect_uri: redirectUri,
+      client_id: clientId,
+      code_verifier: codeVerifier,
+    }),
+  });
+
+  if (!tokenRes.ok) {
+    const err = await tokenRes.text().catch(() => '');
+    throw new Error(`OIDC token exchange failed: ${tokenRes.status} ${redactTokens(err)}`);
+  }
+
+  const tokenData = await tokenRes.json();
+
+  setServiceConfig('jmap', {
+    sessionUrl: `${jmapUrl}/jmap`,
+    bearerToken: tokenData.access_token,
+    refreshToken: tokenData.refresh_token || null,
+    oidcProvider: oidcProviderUrl,
+    clientId,
+  });
+
+  console.log('Twake Mail: connected via OIDC');
 }
 
 async function configureCozy(opts) {

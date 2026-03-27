@@ -1,5 +1,9 @@
 #!/bin/bash
 # twake-cli demo — showcases Chat, Drive, and Mail commands
+#
+# Record:  asciinema rec --cols 90 --rows 30 demo.cast -c "bash demo.sh"
+# Convert: agg demo.cast demo.gif  (or upload: asciinema upload demo.cast)
+#
 # Run with: bash demo.sh
 
 set -e
