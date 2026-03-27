@@ -11,7 +11,9 @@ A unified CLI for interacting with Linagora's open-source collaboration suite. B
 
 ## Demo
 
-> Record your own: `asciinema rec --cols 90 --rows 30 demo.cast -c "bash demo.sh"` then `agg demo.cast demo.gif`
+![twake-cli live demo](demo.gif)
+
+*Live data from jacob@twake.app — March 27, 2026*
 
 ```
 $ twake auth whoami
