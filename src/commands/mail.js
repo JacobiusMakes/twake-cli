@@ -127,11 +127,22 @@ export function mailCommand() {
     .action(async (opts) => {
       const cfg = requireMail();
 
-      // Get inbox mailbox ID, then query emails
+      // Step 1: Find the inbox mailbox ID
+      const { responses: mbResponses } = await jmapRequest(cfg, [
+        ['Mailbox/get', { properties: ['id', 'name', 'role'] }, 'boxes'],
+      ]);
+
+      const boxes = mbResponses.find(r => r[2] === 'boxes')?.[1]?.list || [];
+      const inbox = boxes.find(b => b.role === 'inbox');
+      if (!inbox) {
+        console.log('No inbox found.');
+        return;
+      }
+
+      // Step 2: Query emails in the inbox
       const { responses } = await jmapRequest(cfg, [
-        ['Mailbox/query', { filter: { role: 'inbox' } }, 'findInbox'],
         ['Email/query', {
-          filter: { inMailbox: '#findInbox' },
+          filter: { inMailbox: inbox.id },
           sort: [{ property: 'receivedAt', isAscending: false }],
           limit: parseInt(opts.limit),
         }, 'emailIds'],
@@ -141,7 +152,6 @@ export function mailCommand() {
         }, 'emails'],
       ]);
 
-      // Find the Email/get response
       const emailResponse = responses.find(r => r[2] === 'emails');
       if (!emailResponse) {
         console.log('No response from server.');
