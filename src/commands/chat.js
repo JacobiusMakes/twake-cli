@@ -97,6 +97,88 @@ export function chatCommand() {
     });
 
   chat
+    .command('attach')
+    .description('Send a file to a room')
+    .argument('<room>', 'Room ID or alias')
+    .argument('<file>', 'Local file path')
+    .option('--message <msg>', 'Optional message with the file')
+    .action(async (room, file, opts) => {
+      const cfg = requireChat();
+      const { readFileSync, statSync } = await import('fs');
+      const { basename, extname } = await import('path');
+
+      validateRoomId(room);
+
+      let roomId = room;
+      if (room.startsWith('#')) {
+        const resolved = await matrixFetch(cfg, `/directory/room/${encodeURIComponent(room)}`);
+        roomId = resolved.room_id;
+      }
+
+      const fileName = basename(file);
+      const fileData = readFileSync(file);
+      const fileSize = statSync(file).size;
+
+      // Detect MIME type from extension
+      const mimeTypes = {
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+        '.pdf': 'application/pdf', '.txt': 'text/plain',
+        '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg',
+        '.mp4': 'video/mp4', '.webm': 'video/webm',
+        '.zip': 'application/zip', '.json': 'application/json',
+      };
+      const ext = extname(fileName).toLowerCase();
+      const contentType = mimeTypes[ext] || 'application/octet-stream';
+
+      // Step 1: Upload file to Matrix content repository
+      const uploadUrl = `${cfg.homeserver}/_matrix/media/v3/upload?filename=${encodeURIComponent(fileName)}`;
+      const uploadRes = await fetch(uploadUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${cfg.accessToken}`,
+          'Content-Type': contentType,
+          'User-Agent': USER_AGENT,
+        },
+        body: fileData,
+      });
+
+      if (!uploadRes.ok) {
+        throw new Error(`Upload failed: ${uploadRes.status} ${uploadRes.statusText}`);
+      }
+
+      const { content_uri: contentUri } = await uploadRes.json();
+
+      // Step 2: Send message with file attachment
+      const txnId = `twake-cli-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+      // Determine message type based on MIME
+      let msgtype = 'm.file';
+      if (contentType.startsWith('image/')) msgtype = 'm.image';
+      else if (contentType.startsWith('audio/')) msgtype = 'm.audio';
+      else if (contentType.startsWith('video/')) msgtype = 'm.video';
+
+      const msgBody = {
+        msgtype,
+        body: opts.message || fileName,
+        filename: fileName,
+        url: contentUri,
+        info: {
+          mimetype: contentType,
+          size: fileSize,
+        },
+      };
+
+      await matrixFetch(cfg, `/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`, {
+        method: 'PUT',
+        body: JSON.stringify(msgBody),
+      });
+
+      const sizeStr = fileSize < 1024 ? `${fileSize} B` : `${(fileSize / 1024).toFixed(1)} KB`;
+      console.log(`Sent ${fileName} (${sizeStr}, ${contentType}) to ${room}`);
+    });
+
+  chat
     .command('rooms')
     .description('List joined rooms')
     .action(async () => {
