@@ -28,45 +28,58 @@ function requireMail() {
  * Raw JMAP request — sends method calls to the JMAP API endpoint.
  * JMAP batches multiple method calls in a single HTTP request.
  */
+/**
+ * Decode the email (accountId) from a JWT access token without verification.
+ * JMAP on TMail uses the email address as the account identifier.
+ */
+function getAccountIdFromToken(token) {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+    return payload.email || payload.sub || null;
+  } catch {
+    return null;
+  }
+}
+
 async function jmapRequest(cfg, methodCalls, using = ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail']) {
   /**
-   * JMAP protocol (RFC 8620) has two endpoints:
-   * - Session: GET /.well-known/jmap → returns apiUrl, accountId, capabilities
-   * - API: POST apiUrl → send method calls
-   *
-   * The config stores sessionUrl as "https://jmap.twake.app/jmap" (the API URL).
-   * We derive the session URL by replacing /jmap with /.well-known/jmap.
+   * TMail's JMAP endpoint serves both session (GET) and API (POST) at /jmap.
+   * We try the session fetch first to get apiUrl and accountId.
+   * If that fails (404 on .well-known, or GET /jmap not supported),
+   * we fall back to decoding the accountId from the JWT token
+   * and POSTing directly to the stored URL.
    */
-  const baseUrl = cfg.sessionUrl.replace(/\/jmap$/, '');
-  const sessionUrl = `${baseUrl}/.well-known/jmap`;
+  const apiUrl = cfg.sessionUrl;
+  let accountId = cfg.accountId;
+  let session = null;
 
-  const sessionRes = await fetch(sessionUrl, {
-    headers: {
-      'Authorization': `Bearer ${cfg.bearerToken}`,
-      'Accept': 'application/json',
-      'User-Agent': USER_AGENT,
-    },
-  });
-
-  if (!sessionRes.ok) {
-    throw new Error(`JMAP session error ${sessionRes.status}: ${redactTokens(sessionRes.statusText)}`);
-  }
-
-  const session = await sessionRes.json();
-
-  // The apiUrl from session is relative or absolute
-  let apiUrl = session.apiUrl;
-  if (apiUrl && !apiUrl.startsWith('http')) {
-    apiUrl = `${baseUrl}${apiUrl}`;
-  }
-  // Fallback: use the stored sessionUrl directly as the API endpoint
-  if (!apiUrl) {
-    apiUrl = cfg.sessionUrl;
-  }
-
-  const accountId = cfg.accountId || Object.keys(session.accounts || {})[0];
+  // Try fetching the JMAP session via GET on the API URL
   if (!accountId) {
-    throw new Error('No JMAP account found. Your token may have expired — re-run: twake auth login --mail');
+    try {
+      const sessionRes = await fetch(apiUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${cfg.bearerToken}`,
+          'Accept': 'application/json;jmapVersion=rfc-8621',
+          'User-Agent': USER_AGENT,
+        },
+      });
+      if (sessionRes.ok) {
+        session = await sessionRes.json();
+        accountId = Object.keys(session.accounts || {})[0];
+      }
+    } catch {
+      // Session fetch failed, fall through to JWT decode
+    }
+  }
+
+  // Fallback: extract accountId from the JWT token payload
+  if (!accountId) {
+    accountId = getAccountIdFromToken(cfg.bearerToken);
+  }
+
+  if (!accountId) {
+    throw new Error('Could not determine JMAP account ID. Re-run: twake auth login --mail');
   }
 
   // Inject accountId into method calls
@@ -81,7 +94,8 @@ async function jmapRequest(cfg, methodCalls, using = ['urn:ietf:params:jmap:core
     headers: {
       'Authorization': `Bearer ${cfg.bearerToken}`,
       'Content-Type': 'application/json',
-      'User-Agent': USER_AGENT, // SECURITY: identify twake-cli in requests
+      'Accept': 'application/json;jmapVersion=rfc-8621',
+      'User-Agent': USER_AGENT,
     },
     body: JSON.stringify({ using, methodCalls: calls }),
   });
