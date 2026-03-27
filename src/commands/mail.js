@@ -28,14 +28,21 @@ function requireMail() {
  * Raw JMAP request — sends method calls to the JMAP API endpoint.
  * JMAP batches multiple method calls in a single HTTP request.
  */
+import { createHash } from 'crypto';
+
 /**
- * Decode the email (accountId) from a JWT access token without verification.
- * JMAP on TMail uses the email address as the account identifier.
+ * Derive the JMAP accountId from a JWT access token.
+ *
+ * TMail (Apache James) uses SHA-256(email) as the accountId — the raw email
+ * contains '@' and '.' which are invalid in JMAP accountId format
+ * (must be [#a-zA-Z0-9-_]). The hash produces a valid hex string.
  */
 function getAccountIdFromToken(token) {
   try {
     const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
-    return payload.email || payload.sub || null;
+    const email = payload.email || payload.sub;
+    if (!email) return null;
+    return createHash('sha256').update(email).digest('hex');
   } catch {
     return null;
   }
